@@ -70,6 +70,29 @@ export interface PlayOptions {
   isLive?: boolean;
   /** Starting position in seconds (on-demand only). Default: 0 */
   startPosition?: number;
+  /**
+   * Optional: native-side polling of a now-playing JSON URL so the lock-screen
+   * metadata updates while the app is backgrounded (iOS suspends JS when the
+   * screen locks). The plugin fetches the URL, extracts song/artist/artwork
+   * via simple dot-path expressions, and updates the lock screen directly.
+   * Live streams only.
+   */
+  metadataPoll?: MetadataPollOptions;
+}
+
+export interface MetadataPollOptions {
+  /** URL returning JSON with the current song info */
+  url: string;
+  /** Dot-path to the song title, e.g. "localChart.songs.0.song_name" */
+  titlePath: string;
+  /** Dot-path to the artist name */
+  artistPath: string;
+  /** Dot-path to the artwork URL (optional) */
+  artworkPath?: string;
+  /** Fast cadence in seconds when song is unchanged. Default: 20 */
+  fastIntervalSec?: number;
+  /** Slow cadence after a song change. Default: 120 */
+  slowIntervalSec?: number;
 }
 
 export interface NowPlayingOptions {

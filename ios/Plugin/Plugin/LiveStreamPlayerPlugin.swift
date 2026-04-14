@@ -11,6 +11,18 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
     private var currentUrl: String?
     private var isLive: Bool = true
     private var artworkImage: UIImage?
+    private var timeObserver: Any?
+    private var album: String = ""
+
+    // Metadata polling (runs natively so it keeps ticking when JS is suspended)
+    private var metadataTimer: Timer?
+    private var metadataURL: URL?
+    private var metadataTitlePath: String = ""
+    private var metadataArtistPath: String = ""
+    private var metadataArtworkPath: String?
+    private var metadataFastInterval: TimeInterval = 20
+    private var metadataSlowInterval: TimeInterval = 120
+    private var metadataLastKey: String = ""
 
     // MARK: - Capacitor Methods
 
@@ -27,7 +39,9 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
         let artworkUrl   = call.getString("artworkUrl")
         self.isLive      = call.getBool("isLive") ?? true
         self.currentUrl  = urlString
+        self.album       = album
         let startPos     = call.getDouble("startPosition") ?? 0.0
+        let metadataPoll = call.getObject("metadataPoll")
 
         DispatchQueue.main.async {
             self.setupAudioSession()
@@ -43,7 +57,14 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
 
             self.player?.play()
             self.setupRemoteCommandCenter()
-            self.updateNowPlayingInfo(title: title, artist: artist, album: album, artworkUrl: artworkUrl)
+            self.updateNowPlayingInfo(title: self.htmlDecode(title), artist: self.htmlDecode(artist), album: album, artworkUrl: artworkUrl)
+            self.startTimeObserver()
+
+            if self.isLive, let poll = metadataPoll {
+                self.startMetadataPolling(config: poll)
+            } else {
+                self.stopMetadataPolling()
+            }
 
             call.resolve()
             self.notifyListeners("playerEvent", data: ["type": "play"])
@@ -101,7 +122,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
         if let live = call.getBool("isLive") { self.isLive = live }
 
         DispatchQueue.main.async {
-            self.updateNowPlayingInfo(title: title, artist: artist, album: album, artworkUrl: artworkUrl)
+            self.updateNowPlayingInfo(title: self.htmlDecode(title), artist: self.htmlDecode(artist), album: album, artworkUrl: artworkUrl)
             call.resolve()
         }
     }
@@ -148,10 +169,139 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
     // MARK: - Player
 
     private func destroyPlayer() {
+        stopTimeObserver()
+        stopMetadataPolling()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
         playerItem = nil
+    }
+
+    // MARK: - Metadata Polling
+    // Polls a JSON URL natively and pushes updates to MPNowPlayingInfoCenter.
+    // Runs via a Timer on the main run loop — keeps firing while backgrounded
+    // because the app has UIBackgroundModes=audio and an active AVAudioSession.
+
+    private func startMetadataPolling(config: [String: Any]) {
+        guard let urlString = config["url"] as? String,
+              let url = URL(string: urlString),
+              let titlePath = config["titlePath"] as? String,
+              let artistPath = config["artistPath"] as? String else {
+            return
+        }
+        self.metadataURL = url
+        self.metadataTitlePath = titlePath
+        self.metadataArtistPath = artistPath
+        self.metadataArtworkPath = config["artworkPath"] as? String
+        if let f = config["fastIntervalSec"] as? Double { self.metadataFastInterval = f }
+        if let s = config["slowIntervalSec"] as? Double { self.metadataSlowInterval = s }
+        self.metadataLastKey = ""
+
+        stopMetadataPolling()
+        // Fire immediately, then schedule adaptive next runs.
+        self.pollMetadataOnce()
+    }
+
+    private func stopMetadataPolling() {
+        metadataTimer?.invalidate()
+        metadataTimer = nil
+    }
+
+    private func scheduleNextMetadataPoll(after seconds: TimeInterval) {
+        stopMetadataPolling()
+        metadataTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
+            self?.pollMetadataOnce()
+        }
+        RunLoop.main.add(metadataTimer!, forMode: .common)
+    }
+
+    private func pollMetadataOnce() {
+        guard let url = self.metadataURL else { return }
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self = self, let data = data else {
+                self?.scheduleNextMetadataPoll(after: self?.metadataFastInterval ?? 20)
+                return
+            }
+            guard let obj = try? JSONSerialization.jsonObject(with: data) else {
+                self.scheduleNextMetadataPoll(after: self.metadataFastInterval)
+                return
+            }
+            let title  = self.extractString(from: obj, path: self.metadataTitlePath)  ?? ""
+            let artist = self.extractString(from: obj, path: self.metadataArtistPath) ?? ""
+            let artworkUrl = self.metadataArtworkPath.flatMap { self.extractString(from: obj, path: $0) }
+
+            let key = title + "|" + artist
+            let isFirstFetch = self.metadataLastKey.isEmpty
+            var next = self.metadataFastInterval
+
+            if key != self.metadataLastKey && !title.isEmpty {
+                self.metadataLastKey = key
+                let decodedTitle  = self.htmlDecode(title)
+                let decodedArtist = self.htmlDecode(artist)
+                DispatchQueue.main.async {
+                    self.updateNowPlayingInfo(
+                        title: decodedTitle,
+                        artist: decodedArtist,
+                        album: self.album,
+                        artworkUrl: artworkUrl
+                    )
+                }
+                if !isFirstFetch { next = self.metadataSlowInterval }
+            }
+            DispatchQueue.main.async {
+                self.scheduleNextMetadataPoll(after: next)
+            }
+        }.resume()
+    }
+
+    // Walks "a.b.0.c" style paths against nested dictionaries/arrays.
+    private func extractString(from obj: Any, path: String) -> String? {
+        var current: Any? = obj
+        for part in path.split(separator: ".") {
+            if let idx = Int(part), let arr = current as? [Any], idx >= 0, idx < arr.count {
+                current = arr[idx]
+            } else if let dict = current as? [String: Any] {
+                current = dict[String(part)]
+            } else {
+                return nil
+            }
+        }
+        return current as? String
+    }
+
+    // Decode common HTML entities (&amp;, &#39;, &quot;, etc.) so artist names
+    // like "Philips, Craig &amp; Dean" render cleanly on the lock screen.
+    private func htmlDecode(_ s: String) -> String {
+        guard s.contains("&") else { return s }
+        guard let data = s.data(using: .utf8) else { return s }
+        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
+            .documentType: NSAttributedString.DocumentType.html,
+            .characterEncoding: String.Encoding.utf8.rawValue
+        ]
+        if let attr = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
+            return attr.string
+        }
+        return s
+    }
+
+    // Periodic observer: keeps MPNowPlayingInfoCenter elapsed time in sync for podcasts
+    // so the iOS lock-screen scrubber animates.
+    private func startTimeObserver() {
+        stopTimeObserver()
+        guard !isLive, let player = self.player else { return }
+        let interval = CMTime(seconds: 1.0, preferredTimescale: 600)
+        self.timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] _ in
+            self?.updateElapsedTime()
+        }
+    }
+
+    private func stopTimeObserver() {
+        if let obs = self.timeObserver {
+            self.player?.removeTimeObserver(obs)
+            self.timeObserver = nil
+        }
     }
 
     // MARK: - Remote Command Center
