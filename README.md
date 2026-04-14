@@ -22,9 +22,9 @@ Start streaming a URL. Sets up the lock screen immediately.
 ```typescript
 await LiveStreamPlayer.play({
   url: 'https://stream.example.com/live',
-  title: 'Life FM',
+  title: 'Blast FM',
   artist: 'Live Radio',
-  album: 'UCB Asia Pacific',
+  album: 'Radio Station Company',
   artworkUrl: 'https://example.com/artwork.jpg',
   isLive: true, // hides scrubber/skip on lock screen
 });
