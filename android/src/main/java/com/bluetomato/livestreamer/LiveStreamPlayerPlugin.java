@@ -47,11 +47,11 @@ public class LiveStreamPlayerPlugin extends Plugin {
             MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
         );
         mediaSession.setCallback(new MediaSessionCompat.Callback() {
-            @Override public void onPlay()  { handleRemotePlay(); }
-            @Override public void onPause() { handleRemotePause(); }
-            @Override public void onFastForward() { handleSeekForward(); }
-            @Override public void onRewind()      { handleSeekBackward(); }
-            @Override public void onSeekTo(long pos) { handleSeekTo(pos / 1000.0); }
+            @Override public void onPlay()  { getActivity().runOnUiThread(() -> handleRemotePlay()); }
+            @Override public void onPause() { getActivity().runOnUiThread(() -> handleRemotePause()); }
+            @Override public void onFastForward() { getActivity().runOnUiThread(() -> handleSeekForward()); }
+            @Override public void onRewind()      { getActivity().runOnUiThread(() -> handleSeekBackward()); }
+            @Override public void onSeekTo(long pos) { getActivity().runOnUiThread(() -> handleSeekTo(pos / 1000.0)); }
         });
         mediaSession.setActive(true);
     }
@@ -170,13 +170,15 @@ public class LiveStreamPlayerPlugin extends Plugin {
 
     @PluginMethod
     public void getState(PluginCall call) {
-        JSObject result = new JSObject();
-        result.put("isPlaying", player != null && player.isPlaying());
-        result.put("url", currentUrl != null ? currentUrl : JSObject.NULL);
-        result.put("position", player != null ? player.getCurrentPosition() / 1000.0 : 0.0);
-        result.put("duration", player != null && player.getDuration() != androidx.media3.common.C.TIME_UNSET
-            ? player.getDuration() / 1000.0 : -1.0);
-        call.resolve(result);
+        getActivity().runOnUiThread(() -> {
+            JSObject result = new JSObject();
+            result.put("isPlaying", player != null && player.isPlaying());
+            result.put("url", currentUrl != null ? currentUrl : JSObject.NULL);
+            result.put("position", player != null ? player.getCurrentPosition() / 1000.0 : 0.0);
+            result.put("duration", player != null && player.getDuration() != androidx.media3.common.C.TIME_UNSET
+                ? player.getDuration() / 1000.0 : -1.0);
+            call.resolve(result);
+        });
     }
 
     // MARK: - Helpers
