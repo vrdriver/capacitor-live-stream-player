@@ -45,7 +45,10 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
 
         DispatchQueue.main.async {
             self.setupAudioSession()
+            UIApplication.shared.beginReceivingRemoteControlEvents()
             self.destroyPlayer()
+
+            self.setupRemoteCommandCenter()
 
             self.playerItem = AVPlayerItem(url: url)
             self.player = AVPlayer(playerItem: self.playerItem)
@@ -55,9 +58,8 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
                 self.player?.seek(to: time)
             }
 
-            self.player?.play()
-            self.setupRemoteCommandCenter()
             self.updateNowPlayingInfo(title: self.htmlDecode(title), artist: self.htmlDecode(artist), album: album, artworkUrl: artworkUrl)
+            self.player?.play()
             self.startTimeObserver()
 
             if self.isLive, let poll = metadataPoll {
@@ -109,6 +111,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
             self.destroyPlayer()
             self.currentUrl = nil
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
             call.resolve()
             self.notifyListeners("playerEvent", data: ["type": "stop"])
         }
@@ -159,8 +162,16 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
 
     private func setupAudioSession() {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-            try AVAudioSession.sharedInstance().setActive(true)
+            // .longFormAudio tells the system this is a long-form audio app
+            // (podcasts / radio) — this is what CarPlay uses to attribute the
+            // now-playing client correctly.
+            try AVAudioSession.sharedInstance().setCategory(
+                .playback,
+                mode: .default,
+                policy: .longFormAudio,
+                options: []
+            )
+            try AVAudioSession.sharedInstance().setActive(true, options: [])
         } catch {
             print("[LiveStreamPlayer] AVAudioSession error: \(error)")
         }
@@ -386,8 +397,6 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
             cc.seekBackwardCommand.isEnabled = false;  cc.seekBackwardCommand.removeTarget(nil)
             cc.changePlaybackRateCommand.isEnabled = false; cc.changePlaybackRateCommand.removeTarget(nil)
         }
-
-        UIApplication.shared.beginReceivingRemoteControlEvents()
     }
 
     private func handleRemotePlay() {
@@ -412,12 +421,13 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
     // MARK: - Now Playing Info
 
     private func updateNowPlayingInfo(title: String, artist: String, album: String, artworkUrl: String?) {
+        let isPlaying = (player?.rate ?? 0) > 0
         var info: [String: Any] = [
             MPMediaItemPropertyTitle:            title,
             MPMediaItemPropertyArtist:           artist,
             MPMediaItemPropertyAlbumTitle:       album,
-            MPNowPlayingInfoPropertyPlaybackRate: NSNumber(value: 1.0),
-            MPNowPlayingInfoPropertyIsLiveStream: NSNumber(value: self.isLive),
+            MPNowPlayingInfoPropertyPlaybackRate: NSNumber(value: isPlaying ? 1.0 : 0.0),
+            MPNowPlayingInfoPropertyMediaType:   NSNumber(value: MPNowPlayingInfoMediaType.audio.rawValue),
         ]
 
         if !isLive {
@@ -429,6 +439,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
         }
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
 
         // Load artwork async
         if let artStr = artworkUrl, let artURL = URL(string: artStr) {
@@ -451,6 +462,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = NSNumber(value: player?.currentTime().seconds ?? 0)
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
     }
 
     private func updateElapsedTime() {
