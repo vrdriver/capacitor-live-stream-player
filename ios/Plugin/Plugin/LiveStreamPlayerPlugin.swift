@@ -14,6 +14,21 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
     private var timeObserver: Any?
     private var album: String = ""
 
+    // Stall / reconnect tracking for live streams.
+    private var timeControlObservation: NSKeyValueObservation?
+    private var stallNotificationObserver: NSObjectProtocol?
+    private var failedNotificationObserver: NSObjectProtocol?
+    private var isStalled: Bool = false
+    private var reconnectAttempt: Int = 0
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectWatchdog: DispatchWorkItem?
+    // Grace period before rebuilding the AVPlayerItem on stall — lets a brief
+    // burble recover naturally before we force a skip-to-live.
+    private let stallGraceSeconds: TimeInterval = 2.0
+    // Time we give a fresh AVPlayerItem to reach .playing before emitting
+    // 'reconnecting' and retrying with backoff.
+    private let reconnectTimeoutSeconds: TimeInterval = 5.0
+
     // Metadata polling (runs natively so it keeps ticking when JS is suspended)
     private var metadataTimer: Timer?
     private var metadataURL: URL?
@@ -61,6 +76,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
             self.updateNowPlayingInfo(title: self.htmlDecode(title), artist: self.htmlDecode(artist), album: album, artworkUrl: artworkUrl)
             self.player?.play()
             self.startTimeObserver()
+            self.attachStallObservers()
 
             if self.isLive, let poll = metadataPoll {
                 self.startMetadataPolling(config: poll)
@@ -98,6 +114,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
                 let item = AVPlayerItem(url: url)
                 self.playerItem = item
                 self.player?.replaceCurrentItem(with: item)
+                self.attachStallObservers()
             }
             self.player?.play()
             self.updateNowPlayingPlaybackState(isPlaying: true)
@@ -182,10 +199,134 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
     private func destroyPlayer() {
         stopTimeObserver()
         stopMetadataPolling()
+        detachStallObservers()
+        cancelReconnect()
+        isStalled = false
+        reconnectAttempt = 0
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
         playerItem = nil
+    }
+
+    // MARK: - Stall / Reconnect (live streams)
+    // AVPlayer handles buffer underruns silently and resumes from the buffered
+    // position when the network returns — that causes audio to lag the now-
+    // playing JSON. We detect stalls, force-skip to live by rebuilding the
+    // AVPlayerItem, and surface stall/reconnecting/recovered events to JS.
+
+    private func attachStallObservers() {
+        guard isLive, let item = self.playerItem, let player = self.player else { return }
+        detachStallObservers()
+
+        stallNotificationObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleStall()
+        }
+
+        failedNotificationObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleStall()
+        }
+
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] p, _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                switch p.timeControlStatus {
+                case .playing:
+                    // Playback (re)started — if we were reconnecting, tell JS.
+                    if self.isStalled {
+                        self.isStalled = false
+                        self.reconnectAttempt = 0
+                        self.cancelReconnect()
+                        self.notifyListeners("playerEvent", data: ["type": "recovered"])
+                    }
+                case .waitingToPlayAtSpecifiedRate:
+                    // Buffer underrun on a live stream — treat as a stall.
+                    if self.isLive && !self.isStalled {
+                        self.handleStall()
+                    }
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func detachStallObservers() {
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
+        if let obs = stallNotificationObserver {
+            NotificationCenter.default.removeObserver(obs)
+            stallNotificationObserver = nil
+        }
+        if let obs = failedNotificationObserver {
+            NotificationCenter.default.removeObserver(obs)
+            failedNotificationObserver = nil
+        }
+    }
+
+    private func handleStall() {
+        guard isLive, !isStalled else { return }
+        isStalled = true
+        notifyListeners("playerEvent", data: ["type": "stall"])
+
+        // Give the player a brief grace period to recover naturally before
+        // we force a skip-to-live rebuild.
+        cancelReconnect()
+        let work = DispatchWorkItem { [weak self] in
+            self?.rebuildLiveItem()
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + stallGraceSeconds, execute: work)
+    }
+
+    private func rebuildLiveItem() {
+        guard isLive, let urlString = currentUrl, let url = URL(string: urlString) else { return }
+        // If the player already recovered on its own during the grace window,
+        // timeControlStatus observer will have cleared isStalled.
+        if !isStalled { return }
+
+        let item = AVPlayerItem(url: url)
+        self.playerItem = item
+        self.player?.replaceCurrentItem(with: item)
+        attachStallObservers()
+        self.player?.play()
+
+        // Watchdog: if we don't reach .playing within the timeout, emit
+        // 'reconnecting' and retry with exponential backoff (capped).
+        cancelReconnectWatchdog()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self = self, self.isStalled else { return }
+            self.reconnectAttempt += 1
+            self.notifyListeners("playerEvent", data: [
+                "type": "reconnecting",
+                "attempt": self.reconnectAttempt
+            ])
+            let backoff = min(30.0, pow(2.0, Double(min(self.reconnectAttempt, 4))))
+            let next = DispatchWorkItem { [weak self] in self?.rebuildLiveItem() }
+            self.reconnectWorkItem = next
+            DispatchQueue.main.asyncAfter(deadline: .now() + backoff, execute: next)
+        }
+        reconnectWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + reconnectTimeoutSeconds, execute: watchdog)
+    }
+
+    private func cancelReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        cancelReconnectWatchdog()
+    }
+
+    private func cancelReconnectWatchdog() {
+        reconnectWatchdog?.cancel()
+        reconnectWatchdog = nil
     }
 
     // MARK: - Metadata Polling
@@ -405,6 +546,7 @@ public class LiveStreamPlayerPlugin: CAPPlugin {
             let item = AVPlayerItem(url: url)
             self.playerItem = item
             player?.replaceCurrentItem(with: item)
+            attachStallObservers()
         }
         player?.play()
         updateNowPlayingPlaybackState(isPlaying: true)

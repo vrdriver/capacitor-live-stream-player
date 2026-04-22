@@ -122,11 +122,20 @@ export interface PlayerEvent {
   /**
    * 'play' | 'pause' | 'stop' | 'error' |
    * 'remotePlay' | 'remotePause' |
-   * 'remoteSeekForward' | 'remoteSeekBackward' | 'remoteSeekTo'
+   * 'remoteSeekForward' | 'remoteSeekBackward' | 'remoteSeekTo' |
+   * 'stall' | 'reconnecting' | 'recovered'
+   *
+   * Live-stream lifecycle:
+   *   'stall'        - buffer drained (e.g. reception blackspot). Fired once.
+   *   'reconnecting' - rebuild attempt didn't reach playing in time; includes
+   *                    `attempt` (1-indexed). Retries with backoff.
+   *   'recovered'    - playback resumed at the live edge after a stall.
    */
   type: string;
   /** Seek position in seconds (for remoteSeekTo events) */
   position?: number;
   /** Error message if type === 'error' */
   message?: string;
+  /** Retry counter for 'reconnecting' events (1-indexed) */
+  attempt?: number;
 }

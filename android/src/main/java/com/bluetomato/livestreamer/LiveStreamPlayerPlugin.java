@@ -4,6 +4,8 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.os.Handler;
+import android.os.Looper;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -36,6 +38,20 @@ public class LiveStreamPlayerPlugin extends Plugin {
     private String currentArtworkUrl = "";
     private boolean isLive = true;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    // Stall / reconnect state for live streams.
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable pendingRebuild;
+    private Runnable pendingWatchdog;
+    private boolean isStalled = false;
+    private boolean everReady = false;
+    private int reconnectAttempt = 0;
+    // Grace period before rebuilding the media item on stall — a brief burble
+    // usually recovers on its own without a skip-to-live.
+    private static final long STALL_GRACE_MS = 2000L;
+    // How long we give a rebuilt media item to reach STATE_READY before
+    // emitting 'reconnecting' and retrying with backoff.
+    private static final long RECONNECT_TIMEOUT_MS = 5000L;
 
     @Override
     public void load() {
@@ -80,12 +96,32 @@ public class LiveStreamPlayerPlugin extends Plugin {
 
             player.addListener(new Player.Listener() {
                 @Override public void onPlaybackStateChanged(int state) {
-                    if (state == Player.STATE_READY) player.play();
-                    else if (state == Player.STATE_ENDED) notifyEvent("stop");
+                    if (state == Player.STATE_READY) {
+                        player.play();
+                        if (isLive) {
+                            if (isStalled) {
+                                // We were reconnecting — tell JS we're back.
+                                isStalled = false;
+                                reconnectAttempt = 0;
+                                cancelReconnect();
+                                notifyEvent("recovered");
+                            }
+                            everReady = true;
+                        }
+                    } else if (state == Player.STATE_BUFFERING) {
+                        // Buffer underrun after we'd been playing = stall.
+                        if (isLive && everReady && !isStalled && player.getPlayWhenReady()) {
+                            handleStall();
+                        }
+                    } else if (state == Player.STATE_ENDED) {
+                        notifyEvent("stop");
+                    }
                 }
                 @Override public void onPlayerError(@NonNull androidx.media3.common.PlaybackException e) {
                     JSObject d = new JSObject(); d.put("type","error"); d.put("message", e.getMessage());
                     notifyListeners("playerEvent", d);
+                    // Network-layer errors on a live stream → kick the reconnect loop.
+                    if (isLive) handleStall();
                 }
             });
             player.prepare();
@@ -119,6 +155,10 @@ public class LiveStreamPlayerPlugin extends Plugin {
         getActivity().runOnUiThread(() -> {
             if (player == null) player = new ExoPlayer.Builder(getContext()).build();
             if (isLive) {
+                cancelReconnect();
+                isStalled = false;
+                everReady = false;
+                reconnectAttempt = 0;
                 player.setMediaItem(MediaItem.fromUri(currentUrl));
             }
             player.prepare();
@@ -184,13 +224,73 @@ public class LiveStreamPlayerPlugin extends Plugin {
     // MARK: - Helpers
 
     private void destroyPlayer() {
+        cancelReconnect();
+        isStalled = false;
+        everReady = false;
+        reconnectAttempt = 0;
         if (player != null) { player.stop(); player.release(); player = null; }
+    }
+
+    // MARK: - Stall / Reconnect (live streams)
+    // ExoPlayer silently resumes from the buffered position after a network
+    // blackspot — that leaves audio lagging the now-playing JSON. On stall we
+    // rebuild the media item to force a skip-to-live, and surface
+    // stall/reconnecting/recovered events to JS.
+
+    private void handleStall() {
+        if (!isLive || isStalled) return;
+        isStalled = true;
+        notifyEvent("stall");
+
+        cancelReconnect();
+        pendingRebuild = () -> rebuildLiveItem();
+        mainHandler.postDelayed(pendingRebuild, STALL_GRACE_MS);
+    }
+
+    private void rebuildLiveItem() {
+        if (!isLive || currentUrl == null) return;
+        // Recovered on its own during the grace window — nothing to do.
+        if (!isStalled) return;
+        if (player == null) return;
+
+        player.setMediaItem(MediaItem.fromUri(currentUrl));
+        player.prepare();
+        player.setPlayWhenReady(true);
+
+        cancelWatchdog();
+        pendingWatchdog = () -> {
+            if (!isStalled) return;
+            reconnectAttempt += 1;
+            JSObject d = new JSObject();
+            d.put("type", "reconnecting");
+            d.put("attempt", reconnectAttempt);
+            notifyListeners("playerEvent", d);
+            long backoffMs = (long) Math.min(30_000L, Math.pow(2, Math.min(reconnectAttempt, 4)) * 1000L);
+            pendingRebuild = () -> rebuildLiveItem();
+            mainHandler.postDelayed(pendingRebuild, backoffMs);
+        };
+        mainHandler.postDelayed(pendingWatchdog, RECONNECT_TIMEOUT_MS);
+    }
+
+    private void cancelReconnect() {
+        if (pendingRebuild != null) { mainHandler.removeCallbacks(pendingRebuild); pendingRebuild = null; }
+        cancelWatchdog();
+    }
+
+    private void cancelWatchdog() {
+        if (pendingWatchdog != null) { mainHandler.removeCallbacks(pendingWatchdog); pendingWatchdog = null; }
     }
 
     private void handleRemotePlay() {
         if (currentUrl == null) return;
         if (player == null) player = new ExoPlayer.Builder(getContext()).build();
-        if (isLive) player.setMediaItem(MediaItem.fromUri(currentUrl));
+        if (isLive) {
+            cancelReconnect();
+            isStalled = false;
+            everReady = false;
+            reconnectAttempt = 0;
+            player.setMediaItem(MediaItem.fromUri(currentUrl));
+        }
         player.prepare();
         updatePlaybackState(true);
         notifyEvent("remotePlay");
