@@ -7,11 +7,14 @@
   "types": "dist/esm/index.d.ts",
   "unpkg": "dist/plugin.js",
   "files": [
-    "android/src/main/",
+    "CapacitorLiveStreamPlayer.podspec",
     "android/build.gradle",
+    "android/src/main/",
     "dist/",
     "ios/Plugin/",
-    "CapacitorLiveStreamPlayer.podspec"
+    "rollup.config.js",
+    "src/",
+    "tsconfig.json"
   ],
   "author": "Blue Tomato Media",
   "license": "MIT",
@@ -40,7 +43,9 @@
     "fmt": "prettier \"**/*.{css,html,ts,js,java}\" --write",
     "verify": "npm run verify:ios && npm run verify:android",
     "verify:ios": "cd ios/Plugin && pod install && xcodebuild -workspace Plugin.xcworkspace -scheme Plugin -quiet",
-    "verify:android": "cd android && ./gradlew clean build test"
+    "verify:android": "cd android && ./gradlew clean build test",
+    "prepare": "npm run build:lib",
+    "build:lib": "tsc && rollup -c rollup.config.js"
   },
   "devDependencies": {
     "@capacitor/android": "^6.0.0",
