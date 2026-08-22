@@ -1,7 +1,7 @@
 {
   "name": "capacitor-live-stream-player",
   "version": "1.0.0",
-  "description": "Capacitor plugin for live audio stream playback with native lock screen controls (iOS AVPlayer, Android ExoPlayer). No scrubber, no skip buttons — just play/pause with artwork, title, and artist.",
+  "description": "Capacitor plugin for live audio stream playback with native lock screen controls (iOS AVPlayer, Android ExoPlayer). No scrubber, no skip buttons \u2014 just play/pause with artwork, title, and artist.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",
@@ -53,7 +53,7 @@
     "typescript": "~5.4.0"
   },
   "peerDependencies": {
-    "@capacitor/core": "^6.0.0"
+    "@capacitor/core": ">=6.0.0 <8.0.0"
   },
   "capacitor": {
     "ios": {
