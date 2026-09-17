@@ -59,7 +59,19 @@ public class PlaybackService extends Service {
             return START_NOT_STICKY;
         }
         Notification n = buildNotification();
-        if (n != null) {
+        if (n == null) {
+            // No session/metadata yet — nothing worth showing. Don't leave a
+            // startForegroundService call dangling, or the system kills us.
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        if (ACTION_UPDATE.equals(action)) {
+            // Paused: keep the notification, but let it be dismissible and
+            // allow the service to leave the foreground.
+            stopForeground(STOP_FOREGROUND_DETACH);
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.notify(NOTIFICATION_ID, n);
+        } else {
             startForeground(NOTIFICATION_ID, n);
         }
         return START_STICKY;

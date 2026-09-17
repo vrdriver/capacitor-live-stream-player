@@ -1,9 +1,13 @@
 package com.bluetomato.livestreamer;
 
+import android.Manifest;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.support.v4.media.MediaMetadataCompat;
@@ -11,6 +15,9 @@ import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
+import androidx.media3.common.AudioAttributes;
+import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -20,14 +27,27 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.InputStream;
 import java.net.URL;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-@CapacitorPlugin(name = "LiveStreamPlayer")
+@CapacitorPlugin(
+    name = "LiveStreamPlayer",
+    permissions = {
+        @Permission(alias = LiveStreamPlayerPlugin.NOTIFICATIONS, strings = { Manifest.permission.POST_NOTIFICATIONS })
+    }
+)
 public class LiveStreamPlayerPlugin extends Plugin {
+
+    static final String NOTIFICATIONS = "notifications";
+    // Whether we have already asked this session; the prompt is one-shot and a
+    // refusal must not block playback, only the notification.
+    private boolean notificationsRequested = false;
+
 
     private ExoPlayer player;
     private MediaSessionCompat mediaSession;
@@ -70,10 +90,33 @@ public class LiveStreamPlayerPlugin extends Plugin {
             @Override public void onSeekTo(long pos) { getActivity().runOnUiThread(() -> handleSeekTo(pos / 1000.0)); }
         });
         mediaSession.setActive(true);
+        PlaybackService.setMediaSession(mediaSession);
+    }
+
+    // Android 13+ hides the media notification unless POST_NOTIFICATIONS is
+    // granted. Ask on first playback, where the reason is obvious to the user.
+    private void ensureNotificationPermission() {
+        if (notificationsRequested) return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        notificationsRequested = true;
+        Context context = getContext();
+        if (context == null) return;
+        boolean granted = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED;
+        if (!granted) {
+            requestPermissionForAlias(NOTIFICATIONS, null, "notificationPermissionResult");
+        }
+    }
+
+    @PermissionCallback
+    private void notificationPermissionResult(PluginCall call) {
+        // Nothing to do — playback continues either way, and the next state
+        // change re-posts the notification if permission was granted.
     }
 
     @PluginMethod
     public void play(PluginCall call) {
+        ensureNotificationPermission();
         String url = call.getString("url");
         if (url == null || url.isEmpty()) { call.reject("Missing URL"); return; }
 
@@ -87,7 +130,7 @@ public class LiveStreamPlayerPlugin extends Plugin {
 
         getActivity().runOnUiThread(() -> {
             destroyPlayer();
-            player = new ExoPlayer.Builder(getContext()).build();
+            player = buildPlayer();
             player.setMediaItem(MediaItem.fromUri(url));
 
             if (!isLive && startPos > 0) {
@@ -116,6 +159,12 @@ public class LiveStreamPlayerPlugin extends Plugin {
                     } else if (state == Player.STATE_ENDED) {
                         notifyEvent("stop");
                     }
+                }
+                @Override public void onIsPlayingChanged(boolean isPlaying) {
+                    // Covers pauses we did not initiate: audio focus loss and
+                    // headphones being unplugged.
+                    updatePlaybackState(isPlaying);
+                    notifyEvent(isPlaying ? "play" : "pause");
                 }
                 @Override public void onPlayerError(@NonNull androidx.media3.common.PlaybackException e) {
                     JSObject d = new JSObject(); d.put("type","error"); d.put("message", e.getMessage());
@@ -153,7 +202,7 @@ public class LiveStreamPlayerPlugin extends Plugin {
     public void resume(PluginCall call) {
         if (currentUrl == null) { call.reject("No URL to resume"); return; }
         getActivity().runOnUiThread(() -> {
-            if (player == null) player = new ExoPlayer.Builder(getContext()).build();
+            if (player == null) player = buildPlayer();
             if (isLive) {
                 cancelReconnect();
                 isStalled = false;
@@ -174,6 +223,7 @@ public class LiveStreamPlayerPlugin extends Plugin {
             destroyPlayer();
             currentUrl = null;
             if (mediaSession != null) mediaSession.setActive(false);
+            stopPlaybackService();
             call.resolve();
             notifyEvent("stop");
         });
@@ -324,6 +374,50 @@ public class LiveStreamPlayerPlugin extends Plugin {
         notifyListeners("playerEvent", d);
     }
 
+    // Posts or refreshes the lock-screen / notification-shade media controls.
+    // PlaybackService reads its content straight off the MediaSession, so this
+    // only has to tell the service that something changed.
+    private void syncPlaybackService(boolean isPlaying) {
+        Context context = getContext();
+        if (context == null) return;
+        Intent intent = new Intent(context, PlaybackService.class);
+        if (isPlaying) {
+            intent.setAction(PlaybackService.ACTION_START);
+            // Foreground start is only legal from the background on O+ via
+            // startForegroundService; the service calls startForeground itself.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } else {
+            intent.setAction(PlaybackService.ACTION_UPDATE);
+            context.startService(intent);
+        }
+    }
+
+    private void stopPlaybackService() {
+        Context context = getContext();
+        if (context == null) return;
+        Intent intent = new Intent(context, PlaybackService.class);
+        intent.setAction(PlaybackService.ACTION_STOP);
+        context.startService(intent);
+    }
+
+    // Tells the system this is music, so it takes audio focus, pauses when
+    // headphones are unplugged, and appears in the output switcher.
+    private ExoPlayer buildPlayer() {
+        AudioAttributes attrs = new AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build();
+        return new ExoPlayer.Builder(getContext())
+            .setAudioAttributes(attrs, /* handleAudioFocus= */ true)
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .build();
+    }
+
     private void updateMediaSession(boolean isPlaying) {
         if (mediaSession == null) return;
         long durationMs = isLive ? -1L
@@ -355,7 +449,9 @@ public class LiveStreamPlayerPlugin extends Plugin {
             .setState(isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
                       position, 1.0f)
             .build();
+        if (isPlaying && !mediaSession.isActive()) mediaSession.setActive(true);
         mediaSession.setPlaybackState(state);
+        syncPlaybackService(isPlaying);
     }
 
     private void updateElapsedTime() {
@@ -378,7 +474,11 @@ public class LiveStreamPlayerPlugin extends Plugin {
                     MediaMetadataCompat current = mediaSession.getController().getMetadata();
                     MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder(current)
                         .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bmp);
-                    getActivity().runOnUiThread(() -> mediaSession.setMetadata(builder.build()));
+                    getActivity().runOnUiThread(() -> {
+                        mediaSession.setMetadata(builder.build());
+                        boolean playing = player != null && player.isPlaying();
+                        syncPlaybackService(playing);
+                    });
                 }
             } catch (Exception e) { /* artwork load failed — not critical */ }
         });
@@ -392,6 +492,7 @@ public class LiveStreamPlayerPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         destroyPlayer();
+        stopPlaybackService();
         if (mediaSession != null) { mediaSession.release(); mediaSession = null; }
         executor.shutdown();
     }
