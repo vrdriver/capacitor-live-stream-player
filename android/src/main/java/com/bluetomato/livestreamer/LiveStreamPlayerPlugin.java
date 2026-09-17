@@ -1,6 +1,7 @@
 package com.bluetomato.livestreamer;
 
 import android.Manifest;
+import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -89,6 +90,16 @@ public class LiveStreamPlayerPlugin extends Plugin {
             @Override public void onRewind()      { getActivity().runOnUiThread(() -> handleSeekBackward()); }
             @Override public void onSeekTo(long pos) { getActivity().runOnUiThread(() -> handleSeekTo(pos / 1000.0)); }
         });
+        // Tapping the status-bar media indicator or the output switcher opens
+        // the session's activity. Without this the session has no launchIntent
+        // and the tap does nothing.
+        Intent launch = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+        if (launch != null) {
+            launch.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            mediaSession.setSessionActivity(PendingIntent.getActivity(
+                context, 0, launch,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE));
+        }
         mediaSession.setActive(true);
         PlaybackService.setMediaSession(mediaSession);
     }
